@@ -44,9 +44,10 @@ def _is_allowed(channel_id: str, allowed: Optional[Set[str]]) -> bool:
     return allowed is None or channel_id in allowed
 
 
-def get_ai_response(snippet: str, user_message: str, channel_id: str) -> str:
+def get_ai_response(snippet: str, user_message: str, channel_id: str, user_mention: Optional[str] = None, user_name: Optional[str] = None) -> str:
     """Call LLM (xAI Grok or OpenAI compatible) with injected short-term context.
     Falls back to a memory-aware stub if no API key.
+    user_mention (e.g. "<@123456789>") is provided so the LLM can produce real pings instead of literal @Name text.
     """
     xai_key = os.getenv("XAI_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -55,11 +56,12 @@ def get_ai_response(snippet: str, user_message: str, channel_id: str) -> str:
     if not api_key:
         # No key: still provide value via memory (user sees context is working)
         preview = (snippet or "No prior context.")[:400]
+        mention_info = f" (mention token for this user: {user_mention})" if user_mention else ""
         return (
             "[discord-grok-plugin] No XAI_API_KEY or OPENAI_API_KEY set.\n"
             "Short-term memory is active. Context for this channel:\n"
             f"{preview}\n\n"
-            f"Your message: {user_message[:200]}\n\n"
+            f"Your message: {user_message[:200]}{mention_info}\n\n"
             "Set an API key to enable real Grok/OpenAI replies with continuity."
         )
 
@@ -74,7 +76,10 @@ def get_ai_response(snippet: str, user_message: str, channel_id: str) -> str:
         "You have access to short-term rolling context from previous messages in this channel (Grok build session style). "
         "Use the context to maintain continuity: do not ask the user to repeat information, decisions, or facts already stated. "
         "Keep replies focused and under ~500 words unless the user asks for detail. "
-        "If the provided context block is present, treat it as authoritative recent history."
+        "If the provided context block is present, treat it as authoritative recent history. "
+        "IMPORTANT FOR PINGS: To mention/ping a user (including the person who just spoke), use their exact Discord mention token if provided to you. "
+        "The token looks like <@123456789012345678> and will render as a real clickable @mention that notifies the user. "
+        "Never output bare @Name or @CC text for pings — that will not notify. Only use the token for actual mentions."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -82,6 +87,12 @@ def get_ai_response(snippet: str, user_message: str, channel_id: str) -> str:
         messages.append({
             "role": "system",
             "content": f"[Short-term context for channel {channel_id}]\n{snippet}"
+        })
+    if user_mention:
+        who = user_name or "the user"
+        messages.append({
+            "role": "system",
+            "content": f"Current speaker: {who}. Their exact mention token (use this verbatim in replies if you need to ping/address them): {user_mention}"
         })
     messages.append({"role": "user", "content": user_message})
 
@@ -150,8 +161,13 @@ async def on_message(message: discord.Message):
     # Build Grok-build-style short-term context snippet for prompt injection
     snippet = build_context_prompt_snippet(channel_id)
 
+    # Capture proper Discord mention token for the current speaker.
+    # This is passed to the LLM so it can output real pings (<@id>) instead of literal "@Name" text (which does not notify).
+    user_mention = message.author.mention
+    user_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "user")
+
     # === Generate reply (real LLM or stub) ===
-    ai_response = get_ai_response(snippet, user_msg, channel_id)
+    ai_response = get_ai_response(snippet, user_msg, channel_id, user_mention=user_mention, user_name=user_name)
 
     # === SACRED ORDER: advance last_processed_id + persist exchange BEFORE any Discord send/reply ===
     # This prevents duplicate processing from races, reconnects, or re-delivery.
