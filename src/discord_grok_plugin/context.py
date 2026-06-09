@@ -19,14 +19,22 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+try:  # optional: enables cross-process safety when DISCORD_STATE_DIR is shared
+    from filelock import FileLock
+except Exception:  # pragma: no cover - filelock is an install-time optional
+    FileLock = None  # type: ignore
 
 DEFAULT_LIMIT_RECENT = 8
 DEFAULT_MAX_FACTS = 12
 # Cap each stored message so a single huge paste cannot blow up the JSON file.
 MAX_CONTENT_CHARS = 2000
+# How long to wait for the per-channel lock before proceeding best-effort.
+LOCK_TIMEOUT_SECONDS = 10
 
 
 def _state_dir() -> Path:
@@ -45,6 +53,33 @@ def _context_dir() -> Path:
 
 def _context_path(channel_id: str) -> Path:
     return _context_dir() / f"{channel_id}.json"
+
+
+@contextmanager
+def _locked(channel_id: str) -> Iterator[None]:
+    """Hold a per-channel inter-process lock around a read-modify-write.
+
+    Needed because the README encourages sharing ``DISCORD_STATE_DIR`` between
+    this plugin and other processes (e.g. a scheduler). Degrades to a no-op if
+    ``filelock`` is not installed, and proceeds best-effort on lock timeout
+    rather than hanging the event loop's worker thread.
+    """
+    if FileLock is None:
+        yield
+        return
+    lock = FileLock(str(_context_path(channel_id)) + ".lock", timeout=LOCK_TIMEOUT_SECONDS)
+    try:
+        lock.acquire()
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
 
 
 def _default_ctx(channel_id: str) -> Dict[str, Any]:
@@ -95,9 +130,10 @@ def set_last_processed_id(channel_id: str, last_id: str) -> Dict[str, Any]:
     Used to RESERVE a message id as handled *before* the (slow) LLM call, which
     closes the duplicate-processing window on reconnects / re-deliveries.
     """
-    ctx = load_context(channel_id)
-    ctx["last_processed_id"] = last_id
-    save_context(channel_id, ctx)
+    with _locked(channel_id):
+        ctx = load_context(channel_id)
+        ctx["last_processed_id"] = last_id
+        save_context(channel_id, ctx)
     return ctx
 
 
@@ -117,6 +153,28 @@ def update_context(
     model actually sees what the user said (the previous implementation collapsed
     both into one dict, which dropped the user turn entirely).
     """
+    with _locked(channel_id):
+        return _update_context_locked(
+            channel_id,
+            new_user_message=new_user_message,
+            ai_reply=ai_reply,
+            focus_update=focus_update,
+            facts_add=facts_add,
+            last_id=last_id,
+            trim_recent=trim_recent,
+        )
+
+
+def _update_context_locked(
+    channel_id: str,
+    *,
+    new_user_message: Optional[str],
+    ai_reply: Optional[str],
+    focus_update: Optional[str],
+    facts_add: Optional[List[str]],
+    last_id: Optional[str],
+    trim_recent: int,
+) -> Dict[str, Any]:
     ctx = load_context(channel_id)
 
     if last_id:
@@ -153,7 +211,8 @@ def get_last_processed_id(channel_id: str) -> Optional[str]:
 
 def reset_context(channel_id: str) -> None:
     """Clear short-term memory for the channel (resets the file to defaults)."""
-    save_context(channel_id, _default_ctx(channel_id))
+    with _locked(channel_id):
+        save_context(channel_id, _default_ctx(channel_id))
 
 
 def snippet_from_ctx(ctx: Dict[str, Any], max_recent: int = 6) -> str:
