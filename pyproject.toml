@@ -21,13 +21,28 @@ dependencies = [
     "discord.py>=2.0",
     "openai>=1.0",
     "python-dotenv>=1.0",
+    "filelock>=3.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.4", "mypy>=1.0"]
 
 [project.scripts]
 discord-grok-plugin = "discord_grok_plugin.main:run_bot"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = false

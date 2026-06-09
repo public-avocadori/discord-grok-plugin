@@ -10,12 +10,16 @@ Key correctness / safety properties:
 - Authorisation: admin commands (``!memory`` / ``!forget``) are restricted to
   configured owner ids, and the bot only answers in explicitly allowed channels
   (default-deny) unless ``DISCORD_ALLOW_ALL_CHANNELS=true`` is set.
+- UX & resilience: typing indicator while generating, replies threaded to the
+  triggering message, transient LLM errors retried with backoff, optional
+  per-channel cooldown, and optional periodic key-fact extraction.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Dict, List, Optional, Set
 
 import discord
@@ -24,15 +28,20 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from .context import (
+    get_last_processed_id,
     load_context,
-    update_context,
+    reset_context,
     set_last_processed_id,
     snippet_from_ctx,
-    reset_context,
-    get_last_processed_id,
+    update_context,
 )
 
 DISCORD_MSG_LIMIT = 2000
+_TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504}
+_TRANSIENT_NAMES = {
+    "RateLimitError", "APITimeoutError", "APIConnectionError",
+    "InternalServerError", "APIError",
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,6 +51,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # --- Concurrency / anti-dup state (in-memory, per process) ---
 _channel_locks: Dict[str, asyncio.Lock] = {}
 _inflight_ids: Set[str] = set()
+_last_reply_at: Dict[str, float] = {}     # per-channel cooldown clock (monotonic)
+_turn_counts: Dict[str, int] = {}         # per-channel reply count (for auto-facts)
 
 # --- Cached LLM client (built once per (key, base_url)) ---
 _llm_client: Optional[OpenAI] = None
@@ -90,6 +101,32 @@ def _is_owner(user_id: str) -> bool:
     return bool(owners) and user_id in owners
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cooldown_seconds() -> float:
+    return max(0.0, _env_float("LLM_COOLDOWN_SECONDS", 0.0))
+
+
+def _auto_facts_enabled() -> bool:
+    return os.getenv("LLM_AUTO_FACTS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _facts_every() -> int:
+    return max(1, _env_int("LLM_FACTS_EVERY", 6))
+
+
 # ------------------------------- helpers ----------------------------------- #
 
 def _split_message(text: str, limit: int = DISCORD_MSG_LIMIT) -> List[str]:
@@ -126,6 +163,20 @@ def _get_client() -> Optional[OpenAI]:
     return _llm_client
 
 
+def _is_transient(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in _TRANSIENT_STATUS:
+        return True
+    return type(exc).__name__ in _TRANSIENT_NAMES
+
+
+def _model_name() -> str:
+    xai_key = os.getenv("XAI_API_KEY")
+    return os.getenv("LLM_MODEL") or ("grok-3-mini" if xai_key else "gpt-4o-mini")
+
+
 def get_ai_response(
     snippet: str,
     user_message: str,
@@ -134,7 +185,8 @@ def get_ai_response(
 ) -> str:
     """Call the LLM with injected short-term context. Synchronous on purpose —
     the caller runs it in a worker thread. Falls back to a memory-aware stub when
-    no API key is configured.
+    no API key is configured. Transient errors are retried with backoff
+    (``LLM_MAX_RETRIES``, default 2).
 
     ``user_mention`` (e.g. ``"<@123>"``) lets the model emit a real ping instead
     of literal ``@name`` text, which does not notify anyone.
@@ -150,9 +202,8 @@ def get_ai_response(
             "Set an API key to enable real Grok/OpenAI replies with continuity."
         )
 
-    xai_key = os.getenv("XAI_API_KEY")
-    model = os.getenv("LLM_MODEL") or ("grok-3-mini" if xai_key else "gpt-4o-mini")
-    max_tokens = int(os.getenv("LLM_MAX_TOKENS", "900"))
+    max_tokens = _env_int("LLM_MAX_TOKENS", 900)
+    max_retries = max(0, _env_int("LLM_MAX_RETRIES", 2))
 
     system_prompt = (
         "You are a helpful, concise AI assistant participating in an ongoing Discord conversation. "
@@ -176,18 +227,100 @@ def get_ai_response(
         })
     messages.append({"role": "user", "content": user_message})
 
+    last_err = ""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=_model_name(),
+                messages=messages,  # type: ignore[arg-type]
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            return content or "[LLM returned an empty response. Memory was still updated.]"
+        except Exception as e:  # never leak keys or full traces to Discord
+            last_err = str(e)[:120]
+            if attempt < max_retries and _is_transient(e):
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            break
+    return f"[LLM error while generating reply: {last_err}. Short-term context was preserved.]"
+
+
+def extract_key_facts(snippet: str) -> List[str]:
+    """Ask the LLM to distil durable facts/decisions from the rolling context.
+
+    Returns a short list of bullet strings (empty on any failure). Used by the
+    optional auto-facts feature so memory becomes a real summary rather than
+    just the last few raw messages.
+    """
+    client = _get_client()
+    if client is None or not snippet:
+        return []
     try:
         resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.7,
+            model=_model_name(),
+            messages=[
+                {"role": "system", "content": (
+                    "Extract up to 5 durable facts or decisions from the conversation context "
+                    "that are worth remembering long-term (names, preferences, goals, commitments). "
+                    "Reply with one short fact per line, no numbering, no preamble. "
+                    "If nothing is durable, reply with an empty message."
+                )},
+                {"role": "user", "content": snippet[:4000]},
+            ],
+            max_tokens=200,
+            temperature=0.2,
         )
-        content = (resp.choices[0].message.content or "").strip()
-        return content or "[LLM returned an empty response. Memory was still updated.]"
-    except Exception as e:  # never leak keys or full traces to Discord
-        err = str(e)[:120]
-        return f"[LLM error while generating reply: {err}. Short-term context was preserved.]"
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return []
+    facts = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*•').0123456789 ").strip()
+        if line:
+            facts.append(line[:200])
+    return facts[:5]
+
+
+async def _send_reply(message: discord.Message, text: str) -> None:
+    """Send the reply, threaded to the triggering message, chunked to 2000 chars."""
+    chunks = _split_message(text)
+    for i, chunk in enumerate(chunks):
+        try:
+            if i == 0:
+                try:
+                    await message.reply(chunk, mention_author=False)
+                except Exception:
+                    await message.channel.send(chunk)
+            else:
+                await message.channel.send(chunk)
+        except Exception as send_err:
+            print(f"[discord-grok-plugin] send failed {message.channel.id}/{message.id}: {send_err}")
+            break
+
+
+async def _maybe_extract_facts(channel_id: str) -> None:
+    """Every Nth reply (opt-in), summarise context into key_facts."""
+    if not _auto_facts_enabled() or _get_client() is None:
+        return
+    n = _turn_counts.get(channel_id, 0) + 1
+    _turn_counts[channel_id] = n
+    if n % _facts_every() != 0:
+        return
+    snippet = snippet_from_ctx(load_context(channel_id), max_recent=8)
+    facts = await asyncio.to_thread(extract_key_facts, snippet)
+    if facts:
+        update_context(channel_id, facts_add=facts)
+
+
+def _is_duplicate(mid: str, last: Optional[str]) -> bool:
+    if not last:
+        return False
+    try:
+        return int(mid) <= int(last)
+    except (ValueError, TypeError):
+        return False
 
 
 # ------------------------------- events ------------------------------------ #
@@ -212,15 +345,8 @@ async def on_message(message: discord.Message):
     mid = str(message.id)
     if mid in _inflight_ids:
         return
-
-    # Fast persistent snowflake guard (cheap pre-check before taking the lock).
-    last = get_last_processed_id(channel_id)
-    if last:
-        try:
-            if int(mid) <= int(last):
-                return
-        except (ValueError, TypeError):
-            pass
+    if _is_duplicate(mid, get_last_processed_id(channel_id)):
+        return
 
     content = (message.content or "").strip()
     if not content:
@@ -238,13 +364,16 @@ async def on_message(message: discord.Message):
     try:
         async with lock:
             # Re-check under the lock in case a concurrent delivery won the race.
-            last = get_last_processed_id(channel_id)
-            if last:
-                try:
-                    if int(mid) <= int(last):
-                        return
-                except (ValueError, TypeError):
-                    pass
+            if _is_duplicate(mid, get_last_processed_id(channel_id)):
+                return
+
+            # Per-channel cooldown (opt-in). Rate-limited messages are skipped
+            # without reserving the id, so they aren't marked as "answered".
+            cooldown = _cooldown_seconds()
+            if cooldown > 0:
+                last_at = _last_reply_at.get(channel_id)
+                if last_at is not None and (time.monotonic() - last_at) < cooldown:
+                    return
 
             ctx = load_context(channel_id)            # single load
             snippet = snippet_from_ctx(ctx)
@@ -254,9 +383,10 @@ async def on_message(message: discord.Message):
             set_last_processed_id(channel_id, mid)
 
             mention = getattr(message.author, "mention", None)
-            ai_response = await asyncio.to_thread(
-                get_ai_response, snippet, content, channel_id, mention
-            )
+            async with message.channel.typing():
+                ai_response = await asyncio.to_thread(
+                    get_ai_response, snippet, content, channel_id, mention
+                )
 
             # Persist the full exchange (user + assistant) now that we have it.
             update_context(
@@ -266,13 +396,10 @@ async def on_message(message: discord.Message):
                 last_id=mid,
                 focus_update=content[:160],
             )
+            _last_reply_at[channel_id] = time.monotonic()
 
-            for chunk in _split_message(ai_response):
-                try:
-                    await message.channel.send(chunk)
-                except Exception as send_err:
-                    print(f"[discord-grok-plugin] send failed {channel_id}/{mid}: {send_err}")
-                    break
+            await _send_reply(message, ai_response)
+            await _maybe_extract_facts(channel_id)
     finally:
         _inflight_ids.discard(mid)
 
@@ -313,7 +440,8 @@ def run_bot() -> None:
     if not token:
         print("ERROR: DISCORD_TOKEN is required (set in env or .env file).")
         print("Optional: DISCORD_CHANNEL_ID / DISCORD_CHANNEL_IDS, DISCORD_ALLOW_ALL_CHANNELS,")
-        print("          DISCORD_OWNER_IDS, XAI_API_KEY / OPENAI_API_KEY, LLM_MODEL, LLM_MAX_TOKENS, DISCORD_STATE_DIR")
+        print("          DISCORD_OWNER_IDS, XAI_API_KEY / OPENAI_API_KEY, LLM_MODEL, LLM_MAX_TOKENS,")
+        print("          LLM_MAX_RETRIES, LLM_COOLDOWN_SECONDS, LLM_AUTO_FACTS, LLM_FACTS_EVERY, DISCORD_STATE_DIR")
         return
 
     if _get_allowed_channels() is None and not _allow_all_channels():

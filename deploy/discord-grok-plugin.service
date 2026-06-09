@@ -1,0 +1,25 @@
+# systemd unit for discord-grok-plugin
+# 1. python3 -m venv /opt/discord-grok-plugin/venv && /opt/discord-grok-plugin/venv/bin/pip install discord-grok-plugin
+# 2. Put config in /etc/discord-grok-plugin.env (DISCORD_TOKEN=..., XAI_API_KEY=..., DISCORD_CHANNEL_ID=..., DISCORD_OWNER_IDS=...)
+# 3. cp deploy/discord-grok-plugin.service /etc/systemd/system/
+# 4. systemctl daemon-reload && systemctl enable --now discord-grok-plugin
+[Unit]
+Description=discord-grok-plugin (push-based Discord auto-responder)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=discord-grok-plugin
+Environment=DISCORD_STATE_DIR=%S/discord-grok-plugin
+EnvironmentFile=/etc/discord-grok-plugin.env
+ExecStart=/opt/discord-grok-plugin/venv/bin/discord-grok-plugin
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

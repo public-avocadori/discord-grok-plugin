@@ -10,7 +10,7 @@ This plugin is the "complete form" from day one:
 
 - **Push** (real-time on Discord events)
 - **Non-blocking** — the LLM call runs in a worker thread (`asyncio.to_thread`), so it never freezes the gateway/heartbeat
-- **Grok-build continuity** via per-channel short-term JSON context (`last_processed_id`, `current_focus`, `recent_exchanges`; `key_facts` is an extension hook, not auto-populated)
+- **Grok-build continuity** via per-channel short-term JSON context (`last_processed_id`, `current_focus`, `recent_exchanges`, `key_facts`; `key_facts` is optionally auto-populated via `LLM_AUTO_FACTS`, otherwise an extension hook)
 - **Robust anti-dup**: a per-channel `asyncio.Lock` plus an in-memory in-flight guard, and the message id is **reserved before** the (slow) LLM call — reconnects/re-deliveries/races cannot double-process
 - Works great as a standalone bot **or** alongside Grok build schedulers (shared state dir)
 - General purpose — skills (like いらすとら) are supported via the LLM prompt / your own extensions
@@ -18,15 +18,18 @@ This plugin is the "complete form" from day one:
 ## Features
 - Event-driven, low latency (no 1-min polling) and **non-blocking** LLM calls
 - Short-term memory that survives restarts (per-channel `.json`), storing **both** user and assistant turns
-- Atomic writes (`.tmp` + `os.replace`)
+- Atomic writes (`.tmp` + `os.replace`) + **cross-process file lock** (safe to share the state dir)
 - Snowflake + lock + reserve-before-LLM dedup (no double replies on reconnect/races)
-- Real LLM replies (xAI Grok or any OpenAI-compatible) with context injected
+- Real LLM replies (xAI Grok or any OpenAI-compatible) with context injected, **retried with backoff** on transient errors
+- **Typing indicator** while thinking; replies **threaded** to the triggering message
 - Real `@mention` pings (the model is given the speaker's `<@id>` token)
 - Long replies auto-split into 2000-char Discord chunks
+- Optional **per-channel cooldown** and optional **auto key-fact extraction** (periodic summary)
 - Graceful fallback when no API key (still shows memory is working)
 - **Owner-gated** admin commands: `!memory` / `!ctx` and `!forget`
 - **Default-deny** channel scoping (explicit allow-list or opt-in all-channels)
-- `python -m pip install` + `discord-grok-plugin` entrypoint
+- `pip install` + `discord-grok-plugin` entrypoint **or** `python -m discord_grok_plugin`
+- Tests (pytest) + CI (ruff, mypy); Docker + systemd deploy recipes
 - Cross platform (Windows + Unix), same default state path as Grok build
 
 ## Installation
@@ -84,6 +87,10 @@ The bot now answers with full short-term continuity. Say something, restart the 
 | `DISCORD_OWNER_IDS`     | no       | Comma-separated user ids allowed to run `!memory` / `!forget` |
 | `LLM_MODEL`             | no       | e.g. `grok-3-mini`, `gpt-4o-mini` |
 | `LLM_MAX_TOKENS`        | no       | Default 900 |
+| `LLM_MAX_RETRIES`       | no       | Retries on transient (429/5xx/timeout) errors. Default 2 |
+| `LLM_COOLDOWN_SECONDS`  | no       | Min seconds between replies per channel. Default 0 (off) |
+| `LLM_AUTO_FACTS`        | no       | `true` to periodically summarise context into `key_facts` |
+| `LLM_FACTS_EVERY`       | no       | Run the summary every N replies (with AUTO_FACTS). Default 6 |
 | `DISCORD_STATE_DIR`     | no       | Override memory dir (defaults to `~/.claude/channels/discord`) |
 
 \* **Default-deny:** with no channel allow-list **and** `DISCORD_ALLOW_ALL_CHANNELS` off, the bot stays silent everywhere. Set at least one channel, or explicitly opt into all-channels (careful on big servers).
@@ -167,6 +174,35 @@ print('context roundtrip + both-turns + reset + isolation: OK')
 
 Admin commands (`!memory` / `!ctx` / `!forget`) require the caller's id to be in
 `DISCORD_OWNER_IDS`; otherwise they are politely refused.
+
+Full checks (same as CI):
+
+```bash
+pip install -e ".[dev]"
+pytest -q
+ruff check .
+mypy src/discord_grok_plugin
+```
+
+## Deployment
+
+**Docker:**
+
+```bash
+docker build -t discord-grok-plugin .
+docker run --env-file .env -v dgp-data:/data discord-grok-plugin
+```
+
+The image stores memory under the `/data` volume (`DISCORD_STATE_DIR=/data`).
+
+**systemd** (Linux host): see [`deploy/discord-grok-plugin.service`](deploy/discord-grok-plugin.service).
+Put your config in `/etc/discord-grok-plugin.env`, then:
+
+```bash
+sudo cp deploy/discord-grok-plugin.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now discord-grok-plugin
+```
 
 ## License
 
