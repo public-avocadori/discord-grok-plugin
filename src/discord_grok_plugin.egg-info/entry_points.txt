@@ -1,0 +1,2 @@
+[console_scripts]
+discord-grok-plugin = discord_grok_plugin.main:run_bot

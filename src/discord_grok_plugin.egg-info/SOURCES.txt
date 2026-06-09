@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/discord_grok_plugin/__init__.py
+src/discord_grok_plugin/context.py
+src/discord_grok_plugin/main.py
+src/discord_grok_plugin.egg-info/PKG-INFO
+src/discord_grok_plugin.egg-info/SOURCES.txt
+src/discord_grok_plugin.egg-info/dependency_links.txt
+src/discord_grok_plugin.egg-info/entry_points.txt
+src/discord_grok_plugin.egg-info/requires.txt
+src/discord_grok_plugin.egg-info/top_level.txt
