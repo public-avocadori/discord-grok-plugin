@@ -1,88 +1,104 @@
 #!/usr/bin/env python3
-"""
-Lightweight short-term conversation context for Discord auto-responder.
- (Adapted from original for the plugin package)
+"""Lightweight short-term conversation context for the Discord auto-responder.
 
-Purpose:
-- No permanent/long-term memory (user explicitly does not want DB/vector store).
-- Provide "Grok build session"-like continuity within an active task.
-- Prevent having to re-explain the entire context on every new Discord message.
+Design:
+- No long-term / DB / vector store. Per-channel rolling JSON only
+  ("Grok build session"-style continuity within an active task).
+- Path resolution is LAZY (resolved on each call from ``DISCORD_STATE_DIR``)
+  so the state directory can be overridden at runtime — e.g. in tests — even
+  after this module has been imported. (Previously the path was bound at import
+  time, which silently broke test isolation.)
 
-Usage:
-    from discord_grok_plugin.context import load_context, update_context, build_context_prompt_snippet
-
-    ctx = load_context(channel_id)
-    snippet = build_context_prompt_snippet(channel_id)
-
-    # ... get AI response ...
-
-    update_context(
-        channel_id,
-        new_user_message=message,
-        ai_reply=reply,
-        last_id=message_id,
-        focus_update=...
-    )
+Public API (kept stable for extensions):
+    load_context, update_context, build_context_prompt_snippet,
+    reset_context, get_last_processed_id, set_last_processed_id,
+    snippet_from_ctx, save_context
 """
 
 from __future__ import annotations
+
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-STATE_DIR = Path(os.environ.get("DISCORD_STATE_DIR", Path.home() / ".claude" / "channels" / "discord"))
-CONTEXT_DIR = STATE_DIR / "context"
-CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-
 DEFAULT_LIMIT_RECENT = 8
 DEFAULT_MAX_FACTS = 12
+# Cap each stored message so a single huge paste cannot blow up the JSON file.
+MAX_CONTENT_CHARS = 2000
+
+
+def _state_dir() -> Path:
+    return Path(
+        os.environ.get(
+            "DISCORD_STATE_DIR", Path.home() / ".claude" / "channels" / "discord"
+        )
+    )
+
+
+def _context_dir() -> Path:
+    d = _state_dir() / "context"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _context_path(channel_id: str) -> Path:
-    return CONTEXT_DIR / f"{channel_id}.json"
+    return _context_dir() / f"{channel_id}.json"
+
+
+def _default_ctx(channel_id: str) -> Dict[str, Any]:
+    return {
+        "channel_id": channel_id,
+        "last_processed_id": None,
+        "updated_at": None,
+        "current_focus": "",
+        "key_facts": [],
+        "recent_exchanges": [],
+    }
 
 
 def load_context(channel_id: str) -> Dict[str, Any]:
-    """Load existing short-term context for the channel. Returns a safe default if missing."""
+    """Load short-term context for a channel. Returns a safe default if missing/corrupt."""
     path = _context_path(channel_id)
     if not path.exists():
-        return {
-            "channel_id": channel_id,
-            "last_processed_id": None,
-            "updated_at": None,
-            "current_focus": "",
-            "key_facts": [],
-            "recent_exchanges": [],
-        }
+        return _default_ctx(channel_id)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        data.setdefault("key_facts", [])
-        data.setdefault("recent_exchanges", [])
-        data.setdefault("current_focus", "")
-        return data
     except Exception:
-        return {
-            "channel_id": channel_id,
-            "last_processed_id": None,
-            "updated_at": None,
-            "current_focus": "",
-            "key_facts": [],
-            "recent_exchanges": [],
-        }
+        return _default_ctx(channel_id)
+    # Backfill any missing keys (forward/backward compatibility).
+    data.setdefault("channel_id", channel_id)
+    data.setdefault("last_processed_id", None)
+    data.setdefault("updated_at", None)
+    data.setdefault("current_focus", "")
+    data.setdefault("key_facts", [])
+    data.setdefault("recent_exchanges", [])
+    return data
 
 
 def save_context(channel_id: str, ctx: Dict[str, Any]) -> None:
-    """Atomically write the context file."""
+    """Atomically write the context file (tmp + os.replace)."""
     path = _context_path(channel_id)
-    tmp = path.with_suffix(".json.tmp")
+    tmp = path.with_name(path.name + ".tmp")
     ctx = dict(ctx)
     ctx["updated_at"] = datetime.now(timezone.utc).isoformat()
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(ctx, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def set_last_processed_id(channel_id: str, last_id: str) -> Dict[str, Any]:
+    """Persist ``last_processed_id`` on its own.
+
+    Used to RESERVE a message id as handled *before* the (slow) LLM call, which
+    closes the duplicate-processing window on reconnects / re-deliveries.
+    """
+    ctx = load_context(channel_id)
+    ctx["last_processed_id"] = last_id
+    save_context(channel_id, ctx)
+    return ctx
 
 
 def update_context(
@@ -95,11 +111,11 @@ def update_context(
     last_id: Optional[str] = None,
     trim_recent: int = DEFAULT_LIMIT_RECENT,
 ) -> Dict[str, Any]:
-    """
-    Update the rolling context after processing one exchange.
-    SACRED: call this (with last_id) IMMEDIATELY after generating the reply text,
-    BEFORE sending it on Discord. This guarantees the snowflake guard prevents
-    duplicate handling on reconnects, re-deliveries, or races.
+    """Record one exchange into the rolling context.
+
+    The user message and the AI reply are stored as **separate** entries so the
+    model actually sees what the user said (the previous implementation collapsed
+    both into one dict, which dropped the user turn entirely).
     """
     ctx = load_context(channel_id)
 
@@ -116,17 +132,14 @@ def update_context(
         if len(ctx["key_facts"]) > DEFAULT_MAX_FACTS:
             ctx["key_facts"] = ctx["key_facts"][-DEFAULT_MAX_FACTS:]
 
-    if new_user_message or ai_reply:
-        exchange: Dict[str, Any] = {}
-        if new_user_message:
-            exchange["role"] = "user"
-            exchange["content"] = new_user_message
-        if ai_reply:
-            exchange["role"] = "assistant"
-            exchange["content"] = ai_reply
-        if last_id:
-            exchange["id"] = last_id
-        ctx.setdefault("recent_exchanges", []).append(exchange)
+    for role, content in (("user", new_user_message), ("assistant", ai_reply)):
+        if content:
+            entry: Dict[str, Any] = {"role": role, "content": content[:MAX_CONTENT_CHARS]}
+            if last_id:
+                entry["id"] = last_id
+            ctx["recent_exchanges"].append(entry)
+
+    if trim_recent and len(ctx["recent_exchanges"]) > trim_recent:
         ctx["recent_exchanges"] = ctx["recent_exchanges"][-trim_recent:]
 
     save_context(channel_id, ctx)
@@ -134,28 +147,21 @@ def update_context(
 
 
 def get_last_processed_id(channel_id: str) -> Optional[str]:
-    """Convenience accessor used by main handler for snowflake anti-dup guard."""
+    """Accessor used by the handler's snowflake anti-dup guard."""
     return load_context(channel_id).get("last_processed_id")
 
 
 def reset_context(channel_id: str) -> None:
-    """Clear short-term memory for the channel (keeps the file but resets to defaults)."""
-    fresh: Dict[str, Any] = {
-        "channel_id": channel_id,
-        "last_processed_id": None,
-        "updated_at": None,
-        "current_focus": "",
-        "key_facts": [],
-        "recent_exchanges": [],
-    }
-    save_context(channel_id, fresh)
+    """Clear short-term memory for the channel (resets the file to defaults)."""
+    save_context(channel_id, _default_ctx(channel_id))
 
 
-def build_context_prompt_snippet(channel_id: str, max_recent: int = 6) -> str:
+def snippet_from_ctx(ctx: Dict[str, Any], max_recent: int = 6) -> str:
+    """Build a compact prompt snippet from an already-loaded context dict.
+
+    Prefer this when you have already called :func:`load_context` to avoid
+    re-reading the file.
     """
-    Returns a compact text block you can inject into the AI prompt.
-    """
-    ctx = load_context(channel_id)
     parts: List[str] = []
 
     if ctx.get("current_focus"):
@@ -177,5 +183,11 @@ def build_context_prompt_snippet(channel_id: str, max_recent: int = 6) -> str:
     if not parts:
         return ""
 
+    channel_id = ctx.get("channel_id", "?")
     header = f"[Short-term context for channel {channel_id} — Grok-build-session style continuity]"
     return header + "\n" + "\n\n".join(parts)
+
+
+def build_context_prompt_snippet(channel_id: str, max_recent: int = 6) -> str:
+    """Convenience wrapper that loads the context then builds the snippet."""
+    return snippet_from_ctx(load_context(channel_id), max_recent=max_recent)

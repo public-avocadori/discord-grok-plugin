@@ -9,20 +9,23 @@ Traditional polling loops have timing/race issues and latency.
 This plugin is the "complete form" from day one:
 
 - **Push** (real-time on Discord events)
-- **Grok-build continuity** via per-channel short-term JSON context (`last_processed_id`, `current_focus`, `key_facts`, `recent_exchanges`)
-- **Sacred anti-dup rule**: `last_processed_id` is advanced **immediately before** any reply is sent
+- **Non-blocking** — the LLM call runs in a worker thread (`asyncio.to_thread`), so it never freezes the gateway/heartbeat
+- **Grok-build continuity** via per-channel short-term JSON context (`last_processed_id`, `current_focus`, `recent_exchanges`; `key_facts` is an extension hook, not auto-populated)
+- **Robust anti-dup**: a per-channel `asyncio.Lock` plus an in-memory in-flight guard, and the message id is **reserved before** the (slow) LLM call — reconnects/re-deliveries/races cannot double-process
 - Works great as a standalone bot **or** alongside Grok build schedulers (shared state dir)
 - General purpose — skills (like いらすとら) are supported via the LLM prompt / your own extensions
 
 ## Features
-- Event-driven, low latency (no 1-min polling)
-- Short-term memory that survives restarts (per-channel `.json`)
+- Event-driven, low latency (no 1-min polling) and **non-blocking** LLM calls
+- Short-term memory that survives restarts (per-channel `.json`), storing **both** user and assistant turns
 - Atomic writes (`.tmp` + `os.replace`)
-- Snowflake-based exact dedup guard
+- Snowflake + lock + reserve-before-LLM dedup (no double replies on reconnect/races)
 - Real LLM replies (xAI Grok or any OpenAI-compatible) with context injected
+- Real `@mention` pings (the model is given the speaker's `<@id>` token)
+- Long replies auto-split into 2000-char Discord chunks
 - Graceful fallback when no API key (still shows memory is working)
-- Debug commands: `!memory` / `!ctx` and `!forget`
-- Multi-channel support or "all channels"
+- **Owner-gated** admin commands: `!memory` / `!ctx` and `!forget`
+- **Default-deny** channel scoping (explicit allow-list or opt-in all-channels)
 - `python -m pip install` + `discord-grok-plugin` entrypoint
 - Cross platform (Windows + Unix), same default state path as Grok build
 
@@ -52,8 +55,10 @@ pip install -e .
 ```env
 DISCORD_TOKEN=your_token_here
 XAI_API_KEY=your_xai_key     # or OPENAI_API_KEY
-# DISCORD_CHANNEL_ID=1513374433367036005   # optional single channel
-# DISCORD_CHANNEL_IDS=123,456              # or multiple
+DISCORD_CHANNEL_ID=123456789012345678        # required (default-deny) unless ALLOW_ALL
+# DISCORD_CHANNEL_IDS=123,456                 # or multiple
+# DISCORD_ALLOW_ALL_CHANNELS=true             # answer everywhere instead
+DISCORD_OWNER_IDS=123456789012345678         # who may run !memory / !forget
 ```
 
 6. Run:
@@ -73,29 +78,32 @@ The bot now answers with full short-term continuity. Say something, restart the 
 | `DISCORD_TOKEN`         | yes      | Your bot token |
 | `XAI_API_KEY`           | rec.     | For Grok models (takes precedence) |
 | `OPENAI_API_KEY`        | rec.     | Fallback / generic OpenAI-compatible |
-| `DISCORD_CHANNEL_ID`    | no       | Single channel to listen in |
-| `DISCORD_CHANNEL_IDS`   | no       | Comma-separated list |
+| `DISCORD_CHANNEL_ID`    | no\*     | Single channel to listen in |
+| `DISCORD_CHANNEL_IDS`   | no\*     | Comma-separated list |
+| `DISCORD_ALLOW_ALL_CHANNELS` | no  | `true` to answer in every readable channel |
+| `DISCORD_OWNER_IDS`     | no       | Comma-separated user ids allowed to run `!memory` / `!forget` |
 | `LLM_MODEL`             | no       | e.g. `grok-3-mini`, `gpt-4o-mini` |
 | `LLM_MAX_TOKENS`        | no       | Default 900 |
 | `DISCORD_STATE_DIR`     | no       | Override memory dir (defaults to `~/.claude/channels/discord`) |
 
-If no channel filter is set, the bot will reply in **every channel** it has access to (useful for personal servers, be careful in big ones).
+\* **Default-deny:** with no channel allow-list **and** `DISCORD_ALLOW_ALL_CHANNELS` off, the bot stays silent everywhere. Set at least one channel, or explicitly opt into all-channels (careful on big servers).
 
 ## How the Memory Works (Important)
 
 - Every channel gets its own `context/<channel_id>.json`
-- On every incoming message:
-  1. Check `last_processed_id` (snowflake) → skip if already handled
-  2. Load rolling context + build compact prompt snippet
-  3. Call LLM (snippet + current user msg injected)
-  4. **IMMEDIATELY** `update_context(..., last_id=message.id)` — this is sacred
-  5. Send the reply
+- On every incoming message (under a per-channel lock):
+  1. Check `last_processed_id` (snowflake) + in-flight set → skip if already handled
+  2. Load rolling context **once** + build compact prompt snippet
+  3. **Reserve** the id: `set_last_processed_id(channel_id, message.id)` — *before* the LLM call
+  4. Call the LLM in a worker thread (`asyncio.to_thread`, non-blocking)
+  5. `update_context(...)` to persist the user + assistant turns
+  6. Send the reply (auto-chunked to 2000 chars)
 
-This ordering eliminates the classic "fetch loop saw it but reply not sent yet" duplicate race.
+Reserving the id in step 3 (not after the reply) closes the duplicate window during the slow LLM call; the lock + in-flight set handle true concurrency.
 
-`recent_exchanges` is trimmed (default 8), `key_facts` capped, etc. No permanent memory — exactly as requested.
+`recent_exchanges` is trimmed (default 8) and each message capped (`MAX_CONTENT_CHARS`). No permanent memory — exactly as requested.
 
-You can inspect with `!memory` or `!ctx` and wipe with `!forget` (in the channel).
+Owners can inspect with `!memory` / `!ctx` and wipe with `!forget` (set `DISCORD_OWNER_IDS`).
 
 ## Using with Grok Build / Scheduler (continuity)
 
@@ -130,34 +138,35 @@ pip install -e .
 discord-grok-plugin
 ```
 
-Run tests / checks (add your own later):
+Quick smoke test (paths are resolved lazily, so setting `DISCORD_STATE_DIR`
+**before importing** truly isolates the test from your real `~/.claude`):
 
 ```bash
 pip install -e .
 python -c "
-from discord_grok_plugin.context import load_context, update_context, build_context_prompt_snippet, reset_context, get_last_processed_id
-from discord_grok_plugin.main import run_bot, get_ai_response
 import tempfile, os, shutil
 from pathlib import Path
 
-# Isolated test (does not touch real ~/.claude)
 tmp = tempfile.mkdtemp(prefix='dgp-test-')
-os.environ['DISCORD_STATE_DIR'] = str(Path(tmp)/'state')
+os.environ['DISCORD_STATE_DIR'] = str(Path(tmp)/'state')   # set BEFORE import
+
+from discord_grok_plugin.context import update_context, build_context_prompt_snippet, get_last_processed_id, reset_context
 
 ch='testchan'
-update_context(ch, new_user_message='plan the plugin', ai_reply='done sacred order', last_id='111')
-print('last now:', get_last_processed_id(ch))
-print('snippet has focus?', 'focus' in build_context_prompt_snippet(ch).lower())
+update_context(ch, new_user_message='plan the plugin', ai_reply='ok', last_id='111')
+assert get_last_processed_id(ch) == '111'
+snip = build_context_prompt_snippet(ch)
+assert 'plan the plugin' in snip and 'ok' in snip   # both turns stored
 reset_context(ch)
-print('reset ok')
-
+assert get_last_processed_id(ch) is None
 shutil.rmtree(tmp, ignore_errors=True)
-print('imports + context + sacred update-before-reply + ai stub: OK')
+print('context roundtrip + both-turns + reset + isolation: OK')
 "
-# Also: discord-grok-plugin  (with DISCORD_TOKEN in env/.env) starts the push bot
+# Then: discord-grok-plugin  (with DISCORD_TOKEN in env/.env) starts the push bot
 ```
 
-Debug commands (`!memory` / `!ctx` / `!forget`) are fully supported (the `on_message` handler calls `bot.process_commands` for `!` messages and after normal flow).
+Admin commands (`!memory` / `!ctx` / `!forget`) require the caller's id to be in
+`DISCORD_OWNER_IDS`; otherwise they are politely refused.
 
 ## License
 
