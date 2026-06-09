@@ -359,6 +359,18 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # === STRICT MENTION-ONLY FILTER (user explicit requirement) ===
+    # Only react to messages where this bot is directly mentioned (message.mentions contains bot.user).
+    # This prevents the bot from responding to:
+    # - any non-mention messages
+    # - messages that mention @CC or other users/IDs (even if from allowed users)
+    # Bot ID is 1513375592966258688 (@Ani). discord.py populates .mentions reliably for users it can resolve.
+    # Non-qualifying messages are ignored early (no memory update, no AI call, no reply).
+    # !commands above still dispatch (owner-only debug cmds like !memory remain usable).
+    if bot.user is None or bot.user not in (getattr(message, "mentions", None) or []):
+        await bot.process_commands(message)
+        return
+
     lock = _channel_locks.setdefault(channel_id, asyncio.Lock())
     _inflight_ids.add(mid)
     try:

@@ -150,3 +150,41 @@ Then in Discord: talk normally. Use `!memory` (or `!ctx`) to inspect rolling sho
 All per "最初から完成形" and "開発しなさいよ" — code changes + verification only.
 
 Next user command will be acted on immediately (more code, runs, etc).
+
+## Mention Filter Enforcement Fix (2026-06-xx, repeated user reports)
+**User explicit requirements (multiple times):**
+- "メンションなしも拾ってるよね？メンションなしは拾わないようにして"
+- "あなたのユーザーIDは1513375592966258688だよね？メンション貰ったやつしか反応しなくていいよ"
+- "まだ@CCに反応してるぞ", "まだ、反応してるんだけど、どういうことｗｗｗｗｗｗ", "なんで@1513762349700354119ではないやつに反応してんの？"
+- Only react to messages containing the bot's own mention token (raw `<@1513375592966258688>` or `<@!1513375592966258688>` or name form), only from username "avocadori". Never non-mentions, never messages that @ other people (CC or 15137... etc) even if avocadori posted them.
+
+**Root cause (from investigation):**
+- Scheduler auto-responder relies on LLM parsing the text output of `discord__fetch_messages` (format: `[ts] username: content (id: ...)`). The "contains bot mention" check in previous prompt version was present but LLM could loosely select or mis-parse lines containing other `<@ID>` or no ID.
+- Packaged plugin `on_message` had zero incoming-mention filter (only anti-dup, self, bot, channel, !cmd guards). It would reply + update memory for *any* message in an allowed channel.
+- Fetch tool output *does* preserve raw mention markup `<@1513375592966258688>` in the content portion (verified via live fetch), so string checks are viable.
+
+**Plan (checkable, follow in order):**
+- [x] Investigate: read prompt, json state (LAST_ID=1513888184205967421), plugin main.py + context.py, grep for mention, live `fetch_messages` to observe format + recent history (good mentions have the token; CC messages have other IDs; "me" are bot replies).
+- [ ] Strengthen `auto_responder_prompt.txt`: 
+  - CRITICAL RULES: make "only avocadori + only bot token" non-negotiable, repeated.
+  - Step 4 (find next): use *deterministic python filter* (write raw fetch to $env:TEMP via Out-File here-string, python parses lines, uses `'in'` for exact tokens `'<@1513375592966258688>'` and `'<@!1513375592966258688>'`, username=="avocadori", id > last; prints `QUALIFYING id=...` or `NO_QUALIFYING` + reason).
+  - Add explicit pre-advance verification: before step 5a update, must quote the matched token substring from the chosen content and log "VERIFIED contains bot token".
+  - If in doubt / no match / other IDs present without bot token → SKIP, no last_id advance, no reply.
+- [ ] Add mention guard to plugin `main.py` `on_message`: after author/self/bot/duplicate/allowed/content/! checks, before lock/LLM: `if bot.user is None or bot.user not in (message.mentions or []): await bot.process_commands(message); return`. This makes the *distributable* version also respect "only when mentioned me".
+- [ ] Update channel context json (via helper or direct): add fact describing the repeated bug + the enforced fix; tighten `current_focus`.
+- [ ] Verify: re-read edited files, run python import/ctx tests on plugin, optionally re-fetch to confirm format. Update this todo with pass/fail + excerpts.
+- [ ] Git: commit the plugin change + todo update (message refs the user quotes), push to origin. Confirm `git status` clean and log shows the commit.
+- [ ] Lessons: append to lessons or this file's review the pattern ("textual LLM filter on tool output is unreliable for security-like rules → push the decision into python 'in' + native discord.py .mentions; repeat rules + negative cases in prompts; verify with live fetch").
+- [ ] (Optional) After push, if scheduler runs again it should now use the updated prompt and stay silent on non-qualifying msgs. Confirm with user-provided test mention only.
+
+**Why this (elegant, minimal, follows core principles):**
+- Minimal impact: prompt text changes + ~8 lines guard in on_message.
+- No laziness: root cause (LLM discretion on parse) fixed by moving filter to python code path where possible + ultra-strict repeated instructions + verify step.
+- Sacred order preserved (the filter happens in "find next", then sacred advance still in 5a).
+- Both the live auto-responder (scheduler prompt) and the shipped plugin are fixed.
+- Uses existing patterns (python -c + temp for long content as in prior quoting fixes; discord.py mentions list which is authoritative).
+
+All previous "filter added" attempts only edited prompt text without making the selection deterministic or guarding the plugin path → user still saw reactions. This closes the loop.
+
+**Status:** In progress (plan written, investigation complete via reads + live fetch + grep). Next: edit prompt.
+
