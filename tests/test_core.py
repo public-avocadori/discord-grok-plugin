@@ -7,6 +7,7 @@ setting the env var in a fixture is enough — no real ~/.claude is touched).
 import asyncio
 
 import pytest
+
 from discord_grok_plugin import context as C
 from discord_grok_plugin import main as M
 
